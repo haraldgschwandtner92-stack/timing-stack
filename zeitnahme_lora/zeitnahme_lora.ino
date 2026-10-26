@@ -115,7 +115,7 @@ void sendPkt(uint8_t type, uint16_t runId, uint8_t copy, uint32_t offsetUs) {
 // Bei der V3.2 ist die Beschaltung anders: zeigt das Display Unsinn, VBAT_CTRL_ACTIVE auf HIGH ändern.
 #define VBAT_CTRL_PIN    37
 #define VBAT_READ_PIN    1
-#define VBAT_CTRL_ACTIVE LOW
+#define VBAT_CTRL_ACTIVE HIGH
 #define VBAT_FACTOR_X100 490      // Feinabgleich mit Multimeter (z. B. 485 oder 495)
 
 uint16_t readBattMv() {
