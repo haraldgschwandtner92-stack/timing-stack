@@ -410,7 +410,6 @@ int queueCount = 0;
 
 uint32_t lastSeenMs = 0;
 bool seenOnce = false;
-float lastRssi = 0, lastSnr = 0;
 uint16_t startBatt = 0;
 
 // Uhrzeit
