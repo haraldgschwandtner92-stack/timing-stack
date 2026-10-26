@@ -871,6 +871,7 @@ void loopZiel() {
         sendPkt(T_RESULT, 0, 0, 0, finishedRunNo);
         rxFlag = false;
         radio.startReceive();
+        startFlash();                            // Display blinkt bei Zieleinlauf
         lastDraw = 0;
         Serial.printf("Ziel #%u: %.3f s (Queue: %d)\n", finishedRunNo, s, queueCount);
       } else {
