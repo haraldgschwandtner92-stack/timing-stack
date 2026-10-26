@@ -130,11 +130,11 @@ void fmtV(char* out, size_t n, uint16_t mv) {
   else snprintf(out, n, "%u.%02u", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
 }
 
-// Akkuspannung in Prozent umrechnen (3.0V = 0%, 4.2V = 100%, linear)
+// Akkuspannung in Prozent umrechnen (3.0V = 0%, 4.0V = 100%, linear)
 uint8_t battPercent(uint16_t mv) {
   if (mv < 3000) return 0;
-  if (mv > 4200) return 100;
-  return (uint8_t)((mv - 3000) * 100 / 1200);
+  if (mv > 4000) return 100;
+  return (uint8_t)((mv - 3000) * 100 / 1000);
 }
 
 // ---- Info-Seite: Akku, Empfang etc. (wird bei einfachem Klick angezeigt) ----
