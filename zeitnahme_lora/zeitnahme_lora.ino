@@ -32,7 +32,7 @@
 #define LORA_BUSY 13
 #define LED_PIN   35   // Onboard-LED
 #define VEXT_PIN  36   // LOW = OLED-Versorgung an
-#define START_PIN 4    // Mikroschalter gegen GND (INPUT_PULLUP)
+#define START_PIN 5    // Mikroschalter gegen GND (INPUT_PULLUP)
 #define ZIEL_PIN  5    // Lichtschranke/Schalter gegen GND (INPUT_PULLUP)
 #define BUTTON_PIN 0   // PRG-Taste (= BOOT): nie beim Einschalten/Reset gedrückt halten!
 #define HOLD_ROLE_MS  2000   // so lange halten = Rolle wechseln
