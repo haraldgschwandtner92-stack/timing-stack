@@ -82,6 +82,7 @@ volatile int64_t rxUs = 0;
 uint32_t clashUntil = 0;            // Meldung "ROLLE 2x!" bis zu diesem Zeitpunkt
 Preferences prefs;
 bool isStart = true;                // Rolle, im Flash gespeichert
+float lastRssi = 0, lastSnr = 0;    // Empfangsstärke (global für Info-Seite)
 
 void IRAM_ATTR onRadio() { rxUs = esp_timer_get_time(); rxFlag = true; radioFlag = true; }
 
@@ -144,21 +145,78 @@ void fmtV(char* out, size_t n, uint16_t mv) {
   else snprintf(out, n, "%u.%02u", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
 }
 
+// Akkuspannung in Prozent umrechnen (3.0V = 0%, 4.2V = 100%, linear)
+uint8_t battPercent(uint16_t mv) {
+  if (mv < 3000) return 0;
+  if (mv > 4200) return 100;
+  return (uint8_t)((mv - 3000) * 100 / 1200);
+}
+
+// ---- Info-Seite: Akku, Empfang etc. (wird bei einfachem Klick angezeigt) ----
+uint32_t infoPageUntil = 0;              // zeigt Info-Seite bis zu diesem Zeitpunkt (0 = normale Anzeige)
+#define INFO_PAGE_MS 10000               // Info-Seite wird 10 Sekunden angezeigt
+
+void drawInfoPage(uint16_t sMv, uint16_t zMv, bool link, float rssi = 0, float snr = 0) {
+  char b[32];
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tr);
+  
+  // Überschrift
+  display.drawStr(0, 10, "System-Info");
+  
+  // Akku Start
+  uint8_t sP = battPercent(sMv);
+  if (sMv >= 2000) snprintf(b, sizeof(b), "Start:  %3u%% (%u.%02uV)", sP, sMv/1000, (sMv%1000)/10);
+  else snprintf(b, sizeof(b), "Start:  --");
+  display.drawStr(0, 24, b);
+  
+  // Akku Ziel
+  uint8_t zP = battPercent(zMv);
+  if (zMv >= 2000) snprintf(b, sizeof(b), "Ziel:   %3u%% (%u.%02uV)", zP, zMv/1000, (zMv%1000)/10);
+  else snprintf(b, sizeof(b), "Ziel:   --");
+  display.drawStr(0, 36, b);
+  
+  // Verbindungsstatus
+  snprintf(b, sizeof(b), "Funk:   %s", link ? "OK" : "KEINE");
+  display.drawStr(0, 48, b);
+  
+  // RSSI/SNR wenn Verbindung da
+  if (link && rssi != 0) {
+    snprintf(b, sizeof(b), "RSSI:%ddBm SNR:%.0fdB", (int)rssi, snr);
+    display.drawStr(0, 60, b);
+  }
+  
+  display.sendBuffer();
+}
+
 // Zeile 1: Verbindung links, Status rechts.
-// Zeile 2: Laufnummer links, Akku rechts (S = Start-Gate, Z = Ziel-Gate).
+// Zeile 2: Laufnummer links, Akku in Prozent rechts.
 // Zeilen 3-5: letzte 3 Zeiten.
 void drawScreen(const char* conn, const char* state, uint16_t sMv = 0, uint16_t zMv = 0) {
-  char b[28], vs[8], vz[8];
+  char b[28];
   display.clearBuffer();
   display.setFont(u8g2_font_6x10_tr);
   display.drawStr(0, 10, conn);
   display.drawStr(128 - display.getStrWidth(state), 10, state);
+  
+  // Zeile 2: Laufnummer links, Akku in Prozent rechts (kompakter)
   if (runNo) snprintf(b, sizeof(b), "Lauf %u", runNo); else snprintf(b, sizeof(b), "Lauf -");
   display.drawStr(0, 22, b);
-  fmtV(vs, sizeof(vs), sMv);
-  fmtV(vz, sizeof(vz), zMv);
-  snprintf(b, sizeof(b), "S%s Z%sV", vs, vz);
+  
+  // Akku als Prozent anzeigen (kompakter, keine Überlappung)
+  uint8_t sP = battPercent(sMv);
+  uint8_t zP = battPercent(zMv);
+  if (sMv >= 2000 && zMv >= 2000) {
+    snprintf(b, sizeof(b), "S%u%% Z%u%%", sP, zP);
+  } else if (sMv >= 2000) {
+    snprintf(b, sizeof(b), "S%u%%", sP);
+  } else if (zMv >= 2000) {
+    snprintf(b, sizeof(b), "Z%u%%", zP);
+  } else {
+    snprintf(b, sizeof(b), "");
+  }
   display.drawStr(128 - display.getStrWidth(b), 22, b);
+  
   for (int i = 0; i < 3; i++) {
     display.setFont(i == 0 ? u8g2_font_7x13B_tr : u8g2_font_7x13_tr);   // neueste fett
     if (resMs[i] > 0) {
@@ -226,6 +284,11 @@ void takeResults(const Pkt& r) {
 
 void drawStart() {
   bool link = lastPong && (millis() - lastPong < 10000);
+  // Info-Seite bei kurzem Tastendruck
+  if (millis() < infoPageUntil) {
+    drawInfoPage(battMv, otherBattMv, link, lastRssi, lastSnr);
+    return;
+  }
   drawScreen(link ? "Ziel OK" : "Ziel AUS!",
              millis() < clashUntil ? "ROLLE 2x!" : (noAck ? "KEIN ACK" : (running ? "GESTARTET" : "BEREIT")),
              battMv, otherBattMv);
@@ -240,6 +303,8 @@ bool waitFor(uint8_t type, uint16_t runId, uint32_t ms) {
       Pkt r;
       if (radio.readData((uint8_t*)&r, sizeof(r)) == RADIOLIB_ERR_NONE &&
           r.magic == MAGIC && r.type == type && (type == T_PONG || r.runId == runId)) {
+        lastRssi = radio.getRSSI();
+        lastSnr = radio.getSNR();
         takeResults(r);
         if (type == T_PONG) { running = (r.copy & 1); noAck = false; }
         return true;
@@ -347,7 +412,6 @@ bool haveRun = false;
 
 uint32_t lastSeenMs = 0;
 bool seenOnce = false;
-float lastRssi = 0, lastSnr = 0;
 uint16_t startBatt = 0;
 
 // ---- Uhrzeit (wird vom Handy über die Weboberfläche gesetzt) ----
@@ -475,6 +539,11 @@ void clearRuns() {
 
 void drawZiel() {
   bool link = seenOnce && (millis() - lastSeenMs < 10000);
+  // Info-Seite bei kurzem Tastendruck
+  if (millis() < infoPageUntil) {
+    drawInfoPage(otherBattMv, battMv, link, lastRssi, lastSnr);
+    return;
+  }
   drawScreen(link ? "Start OK" : "Start AUS!",
              millis() < clashUntil ? "ROLLE 2x!" : (millis() < noteUntil ? noteText : (armed ? "GESTARTET" : "BEREIT")),
              otherBattMv, battMv);
@@ -723,10 +792,11 @@ void switchRole() {
 }
 
 // Taste halten: Anzeige zeigt die jeweilige Aktion, beim Loslassen wird sie ausgeführt
+// Kurzer Klick (< 2s): Info-Seite für 10 Sekunden anzeigen
 void buttonCheck() {
   static uint32_t t0 = 0;
   static bool down = false;
-  static uint8_t phase = 0;                           // 0 nichts, 1 Rolle wechseln, 2 Deep Sleep
+  static uint8_t phase = 0;                           // 0 nichts/kurz, 1 Rolle wechseln, 2 Deep Sleep
   bool now = (digitalRead(BUTTON_PIN) == LOW);
   if (now && !down) { down = true; t0 = millis(); phase = 0; }
   if (now && down) {
@@ -743,6 +813,10 @@ void buttonCheck() {
     down = false;
     if (phase == 2) goToSleep();
     else if (phase == 1) switchRole();
+    else {
+      // Kurzer Klick: Info-Seite anzeigen für 10 Sekunden
+      infoPageUntil = millis() + INFO_PAGE_MS;
+    }
     phase = 0;
     lastDraw = 0;
   }
