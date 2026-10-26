@@ -753,7 +753,7 @@ void handleDnf() {
   int idx = findQueueByRunNo(n);
   if (idx >= 0) {
     removeFromQueue(idx);
-    logEvent("DNF", "Lauf #" + String(n), "DNF #" + String(n));
+    logEvent("DNF", "Lauf #" + String(n), "DNF");
   }
   server.send(200, "text/plain", "ok");
 }
