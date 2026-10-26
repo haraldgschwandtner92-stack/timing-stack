@@ -20,7 +20,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
+#include <Update.h>
 #include "driver/gpio.h"
+
+#define FIRMWARE_VERSION "4.1"
 
 // ---- Pins Heltec V3 ----
 #define LORA_SCK  9
@@ -656,6 +659,8 @@ h3{font-size:15px;font-weight:500;margin:16px 0 8px}
 <div class="row"><a class="b" href="/export.csv" download>CSV</a>
 <a class="b" href="/events.csv" download>Ereignisse</a>
 <button onclick="clr()">Löschen</button></div>
+<div class="row"><a class="b" href="/ota">Firmware Update</a></div>
+<div class="c" style="margin-top:8px;font-size:12px">Version )HTML" FIRMWARE_VERSION R"HTML(</div>
 
 <script>
 const f=x=>x.toFixed(3).replace('.',',')+' s';
@@ -790,6 +795,86 @@ void handleReassign() {
   server.send(200, "text/plain", "ok");
 }
 
+// ---- OTA Firmware Update ----
+const char OTA_HTML[] PROGMEM = R"HTML(<!doctype html><html lang="de"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware Update</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0 auto;padding:16px;max-width:400px}
+h2{font-size:18px;font-weight:500}
+.info{background:#8882;padding:12px;border-radius:8px;margin:12px 0}
+input[type=file]{margin:12px 0}
+button{width:100%;padding:12px;font-size:16px;border:none;border-radius:8px;background:#2a7d3a;color:#fff;cursor:pointer}
+button:disabled{background:#888}
+#prog{width:100%;height:20px;margin:12px 0;display:none}
+#msg{margin:12px 0;padding:12px;border-radius:8px}
+.ok{background:#2a7d3a33}.err{background:#c0392b33}
+</style></head><body>
+<h2>Firmware Update</h2>
+<div class="info">
+<strong>Aktuelle Version:</strong> )HTML" FIRMWARE_VERSION R"HTML(<br>
+<strong>Rolle:</strong> ZIEL-Gate
+</div>
+<form id="form">
+<input type="file" id="file" accept=".bin">
+<progress id="prog" value="0" max="100"></progress>
+<div id="msg"></div>
+<button type="submit" id="btn">Update starten</button>
+</form>
+<script>
+const form=document.getElementById('form'),file=document.getElementById('file'),
+      prog=document.getElementById('prog'),msg=document.getElementById('msg'),btn=document.getElementById('btn');
+form.onsubmit=async e=>{
+  e.preventDefault();
+  if(!file.files.length){msg.textContent='Bitte .bin Datei wählen';msg.className='err';return;}
+  btn.disabled=true;prog.style.display='block';msg.textContent='';
+  const data=new FormData();data.append('update',file.files[0]);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/update');
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)prog.value=Math.round(e.loaded/e.total*100);};
+  xhr.onload=()=>{
+    if(xhr.status===200){msg.textContent='Update erfolgreich! Neustart...';msg.className='ok';setTimeout(()=>location.reload(),5000);}
+    else{msg.textContent='Fehler: '+xhr.responseText;msg.className='err';btn.disabled=false;}
+  };
+  xhr.onerror=()=>{msg.textContent='Upload fehlgeschlagen';msg.className='err';btn.disabled=false;};
+  xhr.send(data);
+};
+</script></body></html>)HTML";
+
+void handleOtaPage() {
+  server.send_P(200, "text/html", OTA_HTML);
+}
+
+void handleOtaUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("OTA Update: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("OTA Update erfolgreich: %u Bytes\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
+void handleOtaResult() {
+  if (Update.hasError()) {
+    server.send(500, "text/plain", "Update fehlgeschlagen");
+  } else {
+    server.send(200, "text/plain", "OK");
+    delay(500);
+    ESP.restart();
+  }
+}
+
 void setupZiel() {
   pinMode(ZIEL_PIN, INPUT_PULLUP);
   initDisplay();
@@ -814,6 +899,8 @@ void setupZiel() {
   server.on("/api", handleApi);
   server.on("/dnf", handleDnf);
   server.on("/reassign", handleReassign);
+  server.on("/ota", handleOtaPage);
+  server.on("/update", HTTP_POST, handleOtaResult, handleOtaUpload);
   server.on("/export.csv", []() {
     File f = LittleFS.open(CSV_FILE, "r");
     if (!f) { server.send(404, "text/plain", "Keine Läufe"); return; }
