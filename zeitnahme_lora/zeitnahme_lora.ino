@@ -287,8 +287,8 @@ void setupStart() {
   drawScreen("Starte ...", "");
   if (!initRadio()) { Serial.println("LoRa Fehler"); while (true) delay(1000); }
   battMv = readBattMv();
-  // FALLING: Gate öffnen schließt den Kontakt nach GND (NO). Mit NC-Kontakt auf RISING ändern.
-  attachInterrupt(digitalPinToInterrupt(START_PIN), onStart, FALLING);
+  // RISING: Auslösung bei steigender Flanke (z. B. NC-Kontakt oder Lichtschranke)
+  attachInterrupt(digitalPinToInterrupt(START_PIN), onStart, RISING);
   radio.startReceive();
   Serial.println("Start-Gate bereit");
 }
@@ -610,7 +610,7 @@ void setupZiel() {
   battMv = readBattMv();
   if (!initRadio()) { Serial.println("LoRa Fehler"); while (true) delay(1000); }
   radio.startReceive();
-  attachInterrupt(digitalPinToInterrupt(ZIEL_PIN), onFinish, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ZIEL_PIN), onFinish, RISING);
 
   WiFi.softAP("Zeitnahme", "12345678");          // Passwort ändern
   server.on("/", []() { server.send_P(200, "text/html", INDEX_HTML); });
