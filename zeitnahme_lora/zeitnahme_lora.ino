@@ -720,11 +720,13 @@ h3{font-size:15px;font-weight:500;margin:16px 0 8px}
 <h3>Letzte Ergebnisse</h3>
 <table id="runs"><tr><td>Keine</td></tr></table>
 
-<h3>Korrektur</h3>
+<h3>Korrektur bei Überholen</h3>
+<p style="font-size:12px;color:#888;margin:4px 0">Zielzeit einem anderen Lauf zuweisen (z.B. wenn #2 vor #1 ins Ziel kommt)</p>
 <div class="row">
-<select id="finishSel" style="flex:2"><option value="">Zieldurchfahrt wählen...</option></select>
-<select id="runnerSel" style="flex:2"><option value="">Lauf# zuweisen...</option></select>
-<button onclick="reassign()" class="sm">Zuweisen</button>
+<select id="finishSel" style="flex:2"><option value="">Zielzeit wählen...</option></select>
+<span style="padding:8px">→</span>
+<select id="runnerSel" style="flex:2"><option value="">Neuer Lauf#...</option></select>
+<button onclick="reassign()" class="sm">Tauschen</button>
 </div>
 
 <h3>Auffälligkeiten</h3>
@@ -738,7 +740,7 @@ h3{font-size:15px;font-weight:500;margin:16px 0 8px}
 
 <script>
 const f=x=>x.toFixed(3).replace('.',',')+' s';
-let tsent=0,gd={};
+let tsent=0,gd={},editing=false;
 function sync(d){
  if(!d.timeSet||Date.now()-tsent>60000){
   tsent=Date.now();
@@ -769,19 +771,31 @@ async function upd(){
   // Ergebnisse
   runs.innerHTML=d.runs.length?d.runs.map(r=>'<tr><td>#'+r.n+'</td><td>'+r.t+'</td><td>'+f(r.s)+'</td></tr>').join(''):'<tr><td>Keine</td></tr>';
   
-  // Korrektur-Dropdowns
-  finishSel.innerHTML='<option value="">Zieldurchfahrt...</option>'+d.runs.map(r=>'<option value="'+r.n+'">#'+r.n+' ('+f(r.s)+')</option>').join('');
-  runnerSel.innerHTML='<option value="">Lauf# zuweisen...</option>'+d.queue.map(q=>'<option value="'+q.n+'">#'+q.n+'</option>').join('');
+  // Korrektur-Dropdowns nur aktualisieren wenn nicht gerade bearbeitet wird
+  if(!editing){
+    const fv=finishSel.value,rv=runnerSel.value;
+    finishSel.innerHTML='<option value="">Zielzeit wählen...</option>'+d.runs.map(r=>'<option value="'+r.n+'">#'+r.n+' ('+f(r.s)+')</option>').join('');
+    // Alle Laufnummern anzeigen (auch beendete), damit man Zeiten tauschen kann
+    const allNums=[...new Set([...d.runs.map(r=>r.n),...d.queue.map(q=>q.n)])].sort((a,b)=>a-b);
+    runnerSel.innerHTML='<option value="">Neuer Lauf#...</option>'+allNums.map(n=>'<option value="'+n+'">#'+n+'</option>').join('');
+    finishSel.value=fv;runnerSel.value=rv;
+  }
   
   evts.innerHTML=d.events.length?d.events.map(e=>'<tr><td>'+e.t+'</td><td>'+e.e+'</td></tr>').join(''):'<tr><td>keine</td></tr>';
  }catch(e){document.getElementById('link').textContent='Keine Verbindung';document.getElementById('link').className='pill bad';}
 }
+finishSel.onfocus=runnerSel.onfocus=()=>editing=true;
+finishSel.onblur=runnerSel.onblur=()=>setTimeout(()=>editing=false,200);
 async function dnf(n){if(confirm('Lauf #'+n+' als Ausfall (DNF) markieren?')){await fetch('/dnf?n='+n);upd();}}
 async function reassign(){
  const fn=finishSel.value,rn=runnerSel.value;
  if(!fn||!rn){alert('Bitte beide Felder auswählen');return;}
- if(confirm('Zieldurchfahrt #'+fn+' dem Lauf #'+rn+' zuweisen?')){
-  await fetch('/reassign?finish='+fn+'&runner='+rn);upd();
+ if(fn===rn){alert('Gleiche Nummer - nichts zu tauschen');return;}
+ if(confirm('Zielzeit von #'+fn+' dem Lauf #'+rn+' zuweisen?')){
+  editing=false;
+  await fetch('/reassign?finish='+fn+'&runner='+rn);
+  finishSel.value='';runnerSel.value='';
+  upd();
  }
 }
 async function clr(){if(confirm('Alle Daten löschen?')){await fetch('/clear');upd();}}
