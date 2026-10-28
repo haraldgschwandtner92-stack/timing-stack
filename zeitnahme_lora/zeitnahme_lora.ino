@@ -510,20 +510,24 @@ void appendRun(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix, bool 
   }
   if (hasStart && s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
   pushRecent(no, s, startUnix, endUnix, hasStart);
-  totalFinishes = no;
+  // totalFinishes/totalRuns wird vom Aufrufer gesetzt
   updateResults();
 }
 
 // Speichert einen Zielimpuls ohne Start (Orphan) - kann später zugeordnet werden
 void appendOrphanFinish(uint32_t endUnix, int64_t endUs) {
-  totalFinishes++;
+  // Nächste freie Nummer (max von beiden Zählern + 1)
+  uint16_t nextNo = (totalRuns > totalFinishes ? totalRuns : totalFinishes) + 1;
+  totalFinishes = nextNo;
+  if (nextNo > totalRuns) totalRuns = nextNo;  // Beide synchron halten
+  
   File f = LittleFS.open(CSV_FILE, "a");
   if (f) {
     if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
-    f.printf("%u;0.000;0;%lu;;%s\n", totalFinishes, (unsigned long)endUnix, fmtLocal(endUnix).c_str());
+    f.printf("%u;0.000;0;%lu;;%s\n", nextNo, (unsigned long)endUnix, fmtLocal(endUnix).c_str());
     f.close();
   }
-  pushRecent(totalFinishes, 0, 0, endUnix, false);
+  pushRecent(nextNo, 0, 0, endUnix, false);
   addOrphanFinish(endUnix, endUs);
   updateResults();
 }
@@ -854,16 +858,20 @@ void handleDnf() {
     uint32_t startUnix = queue[idx].startUnix;
     removeFromQueue(idx);
     // DNF als Eintrag speichern (Zeit = 0, nur Startzeit, kein Ziel)
-    totalFinishes++;
+    // Nächste freie Nummer
+    uint16_t nextNo = (totalRuns > totalFinishes ? totalRuns : totalFinishes) + 1;
+    totalFinishes = nextNo;
+    if (nextNo > totalRuns) totalRuns = nextNo;
+    
     File f = LittleFS.open(CSV_FILE, "a");
     if (f) {
       if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
-      f.printf("%u;DNF;%lu;0;%s;DNF\n", totalFinishes, (unsigned long)startUnix, fmtLocal(startUnix).c_str());
+      f.printf("%u;DNF;%lu;0;%s;DNF\n", nextNo, (unsigned long)startUnix, fmtLocal(startUnix).c_str());
       f.close();
     }
-    pushRecent(totalFinishes, 0, startUnix, 0, true);  // hasStart=true, aber Zeit=0 und kein Ziel
+    pushRecent(nextNo, 0, startUnix, 0, true);  // hasStart=true, aber Zeit=0 und kein Ziel
     updateResults();
-    logEvent("DNF", "Lauf #" + String(n) + " -> #" + String(totalFinishes), "DNF");
+    logEvent("DNF", "Start #" + String(n) + " -> Ergebnis #" + String(nextNo), "DNF");
   }
   server.send(200, "text/plain", "ok");
 }
@@ -1091,16 +1099,22 @@ void loopZiel() {
       int64_t dt = fu - queue[oldest].startUs;
       if (dt > 500000) {
         float s = dt / 1000000.0f;
-        uint16_t finishedRunNo = queue[oldest].runNo;
+        uint16_t startRunNo = queue[oldest].runNo;  // Nur für Log/Anzeige
         uint32_t startUnix = queue[oldest].startUnix;
         removeFromQueue(oldest);
-        appendRun(finishedRunNo, s, startUnix, endUnix, true);
-        sendPkt(T_RESULT, 0, 0, 0, finishedRunNo);
+        
+        // Neue Ergebnisnummer vergeben
+        uint16_t resultNo = (totalRuns > totalFinishes ? totalRuns : totalFinishes) + 1;
+        totalFinishes = resultNo;
+        if (resultNo > totalRuns) totalRuns = resultNo;
+        
+        appendRun(resultNo, s, startUnix, endUnix, true);
+        sendPkt(T_RESULT, 0, 0, 0, resultNo);
         rxFlag = false;
         radio.startReceive();
         startFlash();                            // Display blinkt bei Zieleinlauf
         lastDraw = 0;
-        Serial.printf("Ziel #%u: %.3f s (Queue: %d)\n", finishedRunNo, s, queueCount);
+        Serial.printf("Start #%u -> Ergebnis #%u: %.3f s (Queue: %d)\n", startRunNo, resultNo, s, queueCount);
       } else {
         logEvent("Zielimpuls zu kurz", String(dt / 1000000.0f, 3) + " s", "ZU KURZ");
       }
