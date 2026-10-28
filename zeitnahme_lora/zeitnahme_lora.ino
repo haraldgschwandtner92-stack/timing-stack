@@ -1,12 +1,18 @@
-// Zeitnahme Start/Ziel per LoRa + WLAN-Webserver am Ziel  (v4 - Multi-Fahrer)
+// Zeitnahme Start/Ziel per LoRa + WLAN-Webserver am Ziel  (v4.2 - Multi-Fahrer)
 // Board: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262 + OLED)
 // Bibliotheken: RadioLib, U8g2 (beide über den Bibliotheksverwalter)
+//
+// Neu in v4.2:
+//  - Ergebnisse enthalten Start- UND Zielzeit
+//  - Zielimpuls ohne Start wird als "Orphan" gespeichert (für spätere Zuordnung)
+//  - Korrektur-Funktion: Orphan-Zielzeit kann einem Start zugewiesen werden
+//  - Bei Überholen/Fehlauslösung: nachträgliche Zuordnung möglich
+//  - CSV-Format erweitert: Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel
 //
 // Neu in v4:
 //  - Mehrere Fahrer gleichzeitig auf der Strecke (Queue-System)
 //  - Start-Display zeigt die zugewiesene Laufnummer groß an
-//  - Weboberfläche: Zuordnung Zieldurchfahrt ↔ Laufnummer korrigierbar
-//  - Fahrer ohne Zieldurchfahrt (Ausfall) können entfernt werden
+//  - Fahrer ohne Zieldurchfahrt (DNF) können entfernt werden
 //
 // Auf BEIDE Boards dieselbe Datei flashen. Die Rolle (START oder ZIEL) steht im Flash.
 // PRG-Taste: 2 s halten und loslassen = Rolle wechseln (Neustart),
@@ -23,7 +29,7 @@
 #include <Update.h>
 #include "driver/gpio.h"
 
-#define FIRMWARE_VERSION "4.1"
+#define FIRMWARE_VERSION "4.2"
 
 // ---- Pins Heltec V3 ----
 #define LORA_SCK  9
@@ -130,51 +136,6 @@ void fmtV(char* out, size_t n, uint16_t mv) {
   else snprintf(out, n, "%u.%02u", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
 }
 
-// Akkuspannung in Prozent umrechnen (3.0V = 0%, 4.0V = 100%, linear)
-uint8_t battPercent(uint16_t mv) {
-  if (mv < 3000) return 0;
-  if (mv > 4000) return 100;
-  return (uint8_t)((mv - 3000) * 100 / 1000);
-}
-
-// ---- Info-Seite: Akku, Empfang etc. (wird bei einfachem Klick angezeigt) ----
-uint32_t infoPageUntil = 0;              // zeigt Info-Seite bis zu diesem Zeitpunkt (0 = normale Anzeige)
-#define INFO_PAGE_MS 10000               // Info-Seite wird 10 Sekunden angezeigt
-float lastRssi = 0, lastSnr = 0;         // Empfangsstärke (global für Info-Seite)
-
-void drawInfoPage(uint16_t sMv, uint16_t zMv, bool link, float rssi = 0, float snr = 0) {
-  char b[32];
-  display.clearBuffer();
-  display.setFont(u8g2_font_6x10_tr);
-  
-  // Überschrift
-  display.drawStr(0, 10, "System-Info");
-  
-  // Akku Start
-  uint8_t sP = battPercent(sMv);
-  if (sMv >= 2000) snprintf(b, sizeof(b), "Start:  %3u%% (%u.%02uV)", sP, sMv/1000, (sMv%1000)/10);
-  else snprintf(b, sizeof(b), "Start:  --");
-  display.drawStr(0, 24, b);
-  
-  // Akku Ziel
-  uint8_t zP = battPercent(zMv);
-  if (zMv >= 2000) snprintf(b, sizeof(b), "Ziel:   %3u%% (%u.%02uV)", zP, zMv/1000, (zMv%1000)/10);
-  else snprintf(b, sizeof(b), "Ziel:   --");
-  display.drawStr(0, 36, b);
-  
-  // Verbindungsstatus
-  snprintf(b, sizeof(b), "Funk:   %s", link ? "OK" : "KEINE");
-  display.drawStr(0, 48, b);
-  
-  // RSSI/SNR wenn Verbindung da
-  if (link && rssi != 0) {
-    snprintf(b, sizeof(b), "RSSI:%ddBm SNR:%.0fdB", (int)rssi, snr);
-    display.drawStr(0, 60, b);
-  }
-  
-  display.sendBuffer();
-}
-
 // ---- Blinken bei erkanntem Start ----
 #define FLASH_PHASE_MS 200
 #define FLASH_BLINKS   2
@@ -229,14 +190,8 @@ void takeResults(const Pkt& r) {
 
 // Start-Display: zeigt die zugewiesene Laufnummer groß an
 void drawStart() {
-  char b[28];
+  char b[28], vs[8], vz[8];
   bool link = lastPong && (millis() - lastPong < 10000);
-  
-  // Info-Seite bei kurzem Tastendruck
-  if (millis() < infoPageUntil) {
-    drawInfoPage(battMv, otherBattMv, link, lastRssi, lastSnr);
-    return;
-  }
   
   display.clearBuffer();
   display.setFont(u8g2_font_6x10_tr);
@@ -245,20 +200,12 @@ void drawStart() {
   const char* state = millis() < clashUntil ? "ROLLE 2x!" : (noAck ? "KEIN ACK" : "BEREIT");
   display.drawStr(128 - display.getStrWidth(state), 10, state);
   
-  // Zeile 2: Fahrer auf Strecke + Akku in Prozent
+  // Zeile 2: Fahrer auf Strecke + Akku
   snprintf(b, sizeof(b), "Auf Strecke: %u", queueLen);
   display.drawStr(0, 22, b);
-  uint8_t sP = battPercent(battMv);
-  uint8_t zP = battPercent(otherBattMv);
-  if (battMv >= 2000 && otherBattMv >= 2000) {
-    snprintf(b, sizeof(b), "S%u%% Z%u%%", sP, zP);
-  } else if (battMv >= 2000) {
-    snprintf(b, sizeof(b), "S%u%%", sP);
-  } else if (otherBattMv >= 2000) {
-    snprintf(b, sizeof(b), "Z%u%%", zP);
-  } else {
-    b[0] = '\0';
-  }
+  fmtV(vs, sizeof(vs), battMv);
+  fmtV(vz, sizeof(vz), otherBattMv);
+  snprintf(b, sizeof(b), "S%s Z%sV", vs, vz);
   display.drawStr(128 - display.getStrWidth(b), 22, b);
   
   // Wenn gerade ein Start erfolgt ist: Laufnummer groß anzeigen
@@ -292,8 +239,6 @@ bool waitFor(uint8_t type, uint16_t runId, uint32_t ms) {
       Pkt r;
       if (radio.readData((uint8_t*)&r, sizeof(r)) == RADIOLIB_ERR_NONE &&
           r.magic == MAGIC && r.type == type && (type == T_PONG || r.runId == runId)) {
-        lastRssi = radio.getRSSI();
-        lastSnr = radio.getSNR();
         takeResults(r);
         if (type == T_ACK) {
           lastAssignedRunNo = r.runNo;
@@ -410,6 +355,7 @@ int queueCount = 0;
 
 uint32_t lastSeenMs = 0;
 bool seenOnce = false;
+float lastRssi = 0, lastSnr = 0;
 uint16_t startBatt = 0;
 
 // Uhrzeit
@@ -436,8 +382,23 @@ String fmtLocal(uint32_t unixS, bool dateToo = true) {
 #define EVT_FILE "/events.csv"
 #define MAX_RECENT 10
 #define MAX_EVT 10
+#define MAX_ORPHAN 10          // max. Zielimpulse ohne Start (für spätere Zuordnung)
 #define RUN_TIMEOUT_S 1800     // 30 min Timeout für Fahrer auf Strecke
-struct Run { uint16_t no; float s; uint32_t startUnix; };
+struct Run { 
+  uint16_t no; 
+  float s;               // Laufzeit in Sekunden (0 = nur Ziel, kein Start)
+  uint32_t startUnix;    // Unix-Zeit Start (0 = kein Start)
+  uint32_t endUnix;      // Unix-Zeit Ziel
+  bool hasStart;         // true = normaler Lauf, false = nur Zielimpuls (Orphan)
+};
+struct OrphanFinish {    // Zielimpuls ohne zugehörigen Start
+  uint32_t endUnix;      // Unix-Zeit des Zielimpulses
+  int64_t endUs;         // esp_timer Zeitpunkt (für spätere Berechnung)
+  bool valid;
+};
+OrphanFinish orphans[MAX_ORPHAN];
+int orphanCount = 0;
+
 struct Evt { uint32_t unixS; char text[48]; };
 Evt evts[MAX_EVT];
 int nEvt = 0;
@@ -446,6 +407,7 @@ uint32_t noteUntil = 0;
 Run recent[MAX_RECENT];
 int nRecent = 0;
 uint16_t totalRuns = 0;
+uint16_t totalFinishes = 0;   // Zähler für Zielimpulse (auch ohne Start)
 float bestTime = 0;
 
 void logEvent(const char* what, const String& details, const char* note) {
@@ -475,15 +437,38 @@ void IRAM_ATTR onFinish() {
   }
 }
 
-void pushRecent(uint16_t no, float s, uint32_t startUnix) {
+void pushRecent(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix, bool hasStart) {
   if (nRecent < MAX_RECENT) nRecent++;
   for (int i = nRecent - 1; i > 0; i--) recent[i] = recent[i - 1];
-  recent[0] = { no, s, startUnix };
+  recent[0] = { no, s, startUnix, endUnix, hasStart };
+}
+
+void addOrphanFinish(uint32_t endUnix, int64_t endUs) {
+  if (orphanCount < MAX_ORPHAN) orphanCount++;
+  for (int i = orphanCount - 1; i > 0; i--) orphans[i] = orphans[i - 1];
+  orphans[0] = { endUnix, endUs, true };
+}
+
+int findOrphanByIndex(int idx) {
+  int count = 0;
+  for (int i = 0; i < MAX_ORPHAN; i++) {
+    if (orphans[i].valid) {
+      if (count == idx) return i;
+      count++;
+    }
+  }
+  return -1;
 }
 
 void updateResults() {
-  resNo = totalRuns;
-  for (int i = 0; i < 3; i++) resMs[i] = (i < nRecent) ? (uint32_t)(recent[i].s * 1000.0f + 0.5f) : 0;
+  resNo = totalFinishes;
+  for (int i = 0; i < 3; i++) {
+    if (i < nRecent && recent[i].hasStart && recent[i].s > 0) {
+      resMs[i] = (uint32_t)(recent[i].s * 1000.0f + 0.5f);
+    } else {
+      resMs[i] = 0;
+    }
+  }
   runNo = totalRuns + 1;
 }
 
@@ -492,45 +477,82 @@ void loadRuns() {
   if (f) {
     while (f.available()) {
       String l = f.readStringUntil('\n');
+      // Format: Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel
       int i1 = l.indexOf(';');
       if (i1 < 1) continue;
       int i2 = l.indexOf(';', i1 + 1);
       int i3 = (i2 > 0) ? l.indexOf(';', i2 + 1) : -1;
+      int i4 = (i3 > 0) ? l.indexOf(';', i3 + 1) : -1;
       uint16_t no = l.substring(0, i1).toInt();
+      if (no == 0) continue;   // Kopfzeile überspringen
       float s = (i2 > 0 ? l.substring(i1 + 1, i2) : l.substring(i1 + 1)).toFloat();
-      uint32_t su = 0;
+      uint32_t su = 0, eu = 0;
       if (i2 > 0) su = (uint32_t)strtoul((i3 > 0 ? l.substring(i2 + 1, i3) : l.substring(i2 + 1)).c_str(), nullptr, 10);
-      if (no == 0) continue;
-      totalRuns = no;
-      if (bestTime == 0 || s < bestTime) bestTime = s;
-      pushRecent(no, s, su);
+      if (i3 > 0) eu = (uint32_t)strtoul((i4 > 0 ? l.substring(i3 + 1, i4) : l.substring(i3 + 1)).c_str(), nullptr, 10);
+      bool hasStart = (su > 0);
+      totalFinishes = no;
+      if (hasStart) totalRuns = no;
+      if (hasStart && s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
+      pushRecent(no, s, su, eu, hasStart);
     }
     f.close();
   }
   updateResults();
 }
 
-void appendRun(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix) {
+void appendRun(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix, bool hasStart) {
   File f = LittleFS.open(CSV_FILE, "a");
   if (f) {
-    if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;Start;Ziel");
-    f.printf("%u;%.3f;%lu;%s;%s\n", no, s, (unsigned long)startUnix,
+    if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+    f.printf("%u;%.3f;%lu;%lu;%s;%s\n", no, s, (unsigned long)startUnix, (unsigned long)endUnix,
              fmtLocal(startUnix).c_str(), fmtLocal(endUnix).c_str());
     f.close();
   }
-  if (bestTime == 0 || s < bestTime) bestTime = s;
-  pushRecent(no, s, startUnix);
+  if (hasStart && s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
+  pushRecent(no, s, startUnix, endUnix, hasStart);
+  totalFinishes = no;
+  updateResults();
+}
+
+// Speichert einen Zielimpuls ohne Start (Orphan) - kann später zugeordnet werden
+void appendOrphanFinish(uint32_t endUnix, int64_t endUs) {
+  totalFinishes++;
+  File f = LittleFS.open(CSV_FILE, "a");
+  if (f) {
+    if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+    f.printf("%u;0.000;0;%lu;;%s\n", totalFinishes, (unsigned long)endUnix, fmtLocal(endUnix).c_str());
+    f.close();
+  }
+  pushRecent(totalFinishes, 0, 0, endUnix, false);
+  addOrphanFinish(endUnix, endUs);
   updateResults();
 }
 
 void clearRuns() {
   LittleFS.remove(CSV_FILE);
   LittleFS.remove(EVT_FILE);
-  nRecent = 0; totalRuns = 0; bestTime = 0; nEvt = 0;
+  nRecent = 0; totalRuns = 0; totalFinishes = 0; bestTime = 0; nEvt = 0;
   for (int i = 0; i < MAX_QUEUE; i++) queue[i].valid = false;
-  queueCount = 0;
+  for (int i = 0; i < MAX_ORPHAN; i++) orphans[i].valid = false;
+  queueCount = 0; orphanCount = 0;
   updateResults();
   lastDraw = 0;
+}
+
+// CSV komplett neu schreiben (nach Korrektur)
+void rewriteCSV() {
+  File f = LittleFS.open(CSV_FILE, "w");
+  if (f) {
+    f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+    // Schreibe von ältestem zu neuestem
+    for (int i = nRecent - 1; i >= 0; i--) {
+      f.printf("%u;%.3f;%lu;%lu;%s;%s\n", 
+               recent[i].no, recent[i].s, 
+               (unsigned long)recent[i].startUnix, (unsigned long)recent[i].endUnix,
+               fmtLocal(recent[i].startUnix).c_str(), fmtLocal(recent[i].endUnix).c_str());
+    }
+    f.close();
+  }
 }
 
 // Queue-Funktionen
@@ -574,14 +596,8 @@ void removeFromQueue(int idx) {
 }
 
 void drawZiel() {
-  char b[28];
+  char b[28], vs[8], vz[8];
   bool link = seenOnce && (millis() - lastSeenMs < 10000);
-  
-  // Info-Seite bei kurzem Tastendruck
-  if (millis() < infoPageUntil) {
-    drawInfoPage(otherBattMv, battMv, link, lastRssi, lastSnr);
-    return;
-  }
   
   display.clearBuffer();
   display.setFont(u8g2_font_6x10_tr);
@@ -592,20 +608,12 @@ void drawZiel() {
                       (queueCount > 0 ? "AUF STRECKE" : "BEREIT"));
   display.drawStr(128 - display.getStrWidth(state), 10, state);
   
-  // Zeile 2: Fahrer auf Strecke + Akku in Prozent
+  // Zeile 2: Fahrer auf Strecke + Akku
   snprintf(b, sizeof(b), "Fahrer: %d", queueCount);
   display.drawStr(0, 22, b);
-  uint8_t sP = battPercent(otherBattMv);
-  uint8_t zP = battPercent(battMv);
-  if (otherBattMv >= 2000 && battMv >= 2000) {
-    snprintf(b, sizeof(b), "S%u%% Z%u%%", sP, zP);
-  } else if (otherBattMv >= 2000) {
-    snprintf(b, sizeof(b), "S%u%%", sP);
-  } else if (battMv >= 2000) {
-    snprintf(b, sizeof(b), "Z%u%%", zP);
-  } else {
-    b[0] = '\0';
-  }
+  fmtV(vs, sizeof(vs), otherBattMv);
+  fmtV(vz, sizeof(vz), battMv);
+  snprintf(b, sizeof(b), "S%s Z%sV", vs, vz);
   display.drawStr(128 - display.getStrWidth(b), 22, b);
   
   // Zeilen 3-5: letzte 3 Zeiten
@@ -720,13 +728,11 @@ h3{font-size:15px;font-weight:500;margin:16px 0 8px}
 <h3>Letzte Ergebnisse</h3>
 <table id="runs"><tr><td>Keine</td></tr></table>
 
-<h3>Korrektur bei Überholen</h3>
-<p style="font-size:12px;color:#888;margin:4px 0">Zielzeit einem anderen Lauf zuweisen (z.B. wenn #2 vor #1 ins Ziel kommt)</p>
+<h3>Korrektur</h3>
 <div class="row">
-<select id="finishSel" style="flex:2"><option value="">Zielzeit wählen...</option></select>
-<span style="padding:8px">→</span>
-<select id="runnerSel" style="flex:2"><option value="">Neuer Lauf#...</option></select>
-<button onclick="reassign()" class="sm">Tauschen</button>
+<select id="finishSel" style="flex:2"><option value="">Zieldurchfahrt wählen...</option></select>
+<select id="runnerSel" style="flex:2"><option value="">Lauf# zuweisen...</option></select>
+<button onclick="reassign()" class="sm">Zuweisen</button>
 </div>
 
 <h3>Auffälligkeiten</h3>
@@ -740,7 +746,7 @@ h3{font-size:15px;font-weight:500;margin:16px 0 8px}
 
 <script>
 const f=x=>x.toFixed(3).replace('.',',')+' s';
-let tsent=0,gd={},editing=false;
+let tsent=0,gd={};
 function sync(d){
  if(!d.timeSet||Date.now()-tsent>60000){
   tsent=Date.now();
@@ -768,34 +774,26 @@ async function upd(){
     '<button class="sm" onclick="dnf('+q.n+')">DNF</button></div>'
   ).join(''):'<div class="c" style="padding:16px">Keine Fahrer auf der Strecke</div>';
   
-  // Ergebnisse
-  runs.innerHTML=d.runs.length?d.runs.map(r=>'<tr><td>#'+r.n+'</td><td>'+r.t+'</td><td>'+f(r.s)+'</td></tr>').join(''):'<tr><td>Keine</td></tr>';
+  // Ergebnisse (mit Start- und Zielzeit)
+  runs.innerHTML=d.runs.length?d.runs.map(r=>{
+    const zeit=r.hasStart?f(r.s):'<em>kein Start</em>';
+    const cls=r.hasStart?'':'style="color:#c0392b"';
+    return '<tr '+cls+'><td>#'+r.n+'</td><td>S:'+r.st+' Z:'+r.et+'</td><td>'+zeit+'</td></tr>';
+  }).join(''):'<tr><td>Keine</td></tr>';
   
-  // Korrektur-Dropdowns nur aktualisieren wenn nicht gerade bearbeitet wird
-  if(!editing){
-    const fv=finishSel.value,rv=runnerSel.value;
-    finishSel.innerHTML='<option value="">Zielzeit wählen...</option>'+d.runs.map(r=>'<option value="'+r.n+'">#'+r.n+' ('+f(r.s)+')</option>').join('');
-    // Alle Laufnummern anzeigen (auch beendete), damit man Zeiten tauschen kann
-    const allNums=[...new Set([...d.runs.map(r=>r.n),...d.queue.map(q=>q.n)])].sort((a,b)=>a-b);
-    runnerSel.innerHTML='<option value="">Neuer Lauf#...</option>'+allNums.map(n=>'<option value="'+n+'">#'+n+'</option>').join('');
-    finishSel.value=fv;runnerSel.value=rv;
-  }
+  // Korrektur-Dropdowns: Orphan-Zielzeiten können Starts zugewiesen werden
+  finishSel.innerHTML='<option value="">Zielzeit wählen...</option>'+d.runs.filter(r=>!r.hasStart).map(r=>'<option value="'+r.n+'">Z#'+r.n+' ('+r.et+')</option>').join('');
+  runnerSel.innerHTML='<option value="">Start zuweisen...</option>'+d.queue.map(q=>'<option value="'+q.n+'">#'+q.n+' ('+q.t+')</option>').join('');
   
   evts.innerHTML=d.events.length?d.events.map(e=>'<tr><td>'+e.t+'</td><td>'+e.e+'</td></tr>').join(''):'<tr><td>keine</td></tr>';
  }catch(e){document.getElementById('link').textContent='Keine Verbindung';document.getElementById('link').className='pill bad';}
 }
-finishSel.onfocus=runnerSel.onfocus=()=>editing=true;
-finishSel.onblur=runnerSel.onblur=()=>setTimeout(()=>editing=false,200);
 async function dnf(n){if(confirm('Lauf #'+n+' als Ausfall (DNF) markieren?')){await fetch('/dnf?n='+n);upd();}}
 async function reassign(){
  const fn=finishSel.value,rn=runnerSel.value;
  if(!fn||!rn){alert('Bitte beide Felder auswählen');return;}
- if(fn===rn){alert('Gleiche Nummer - nichts zu tauschen');return;}
- if(confirm('Zielzeit von #'+fn+' dem Lauf #'+rn+' zuweisen?')){
-  editing=false;
-  await fetch('/reassign?finish='+fn+'&runner='+rn);
-  finishSel.value='';runnerSel.value='';
-  upd();
+ if(confirm('Zieldurchfahrt #'+fn+' dem Lauf #'+rn+' zuweisen?')){
+  await fetch('/reassign?finish='+fn+'&runner='+rn);upd();
  }
 }
 async function clr(){if(confirm('Alle Daten löschen?')){await fetch('/clear');upd();}}
@@ -829,8 +827,11 @@ void handleApi() {
   j += "],\"runs\":[";
   for (int i = 0; i < nRecent; i++) {
     if (i) j += ",";
-    j += "{\"n\":" + String(recent[i].no) + ",\"s\":" + String(recent[i].s, 3) +
-         ",\"t\":\"" + fmtLocal(recent[i].startUnix, false) + "\"}";
+    j += "{\"n\":" + String(recent[i].no) + 
+         ",\"s\":" + String(recent[i].s, 3) +
+         ",\"st\":\"" + fmtLocal(recent[i].startUnix, false) + "\"" +
+         ",\"et\":\"" + fmtLocal(recent[i].endUnix, false) + "\"" +
+         ",\"hasStart\":" + String(recent[i].hasStart ? "true" : "false") + "}";
   }
   j += "],\"events\":[";
   for (int i = 0; i < nEvt; i++) {
@@ -852,34 +853,64 @@ void handleDnf() {
 }
 
 void handleReassign() {
-  int finishNo = server.arg("finish").toInt();
-  int runnerNo = server.arg("runner").toInt();
+  int finishNo = server.arg("finish").toInt();   // Orphan-Zielzeit (ohne Start)
+  int runnerNo = server.arg("runner").toInt();   // Start aus der Queue
   
+  // Finde den Start in der Queue
   int qIdx = findQueueByRunNo(runnerNo);
   if (qIdx < 0) {
-    server.send(400, "text/plain", "Lauf nicht in Queue");
+    server.send(400, "text/plain", "Start nicht in Queue");
     return;
   }
   
-  // Finde die Zielzeit in recent und ändere die Laufnummer
+  // Finde die Orphan-Zielzeit in recent
+  int recentIdx = -1;
   for (int i = 0; i < nRecent; i++) {
-    if (recent[i].no == finishNo) {
-      float oldTime = recent[i].s;
-      uint32_t oldStartUnix = recent[i].startUnix;
-      
-      // Berechne neue Zeit basierend auf dem tatsächlichen Start
-      int64_t finishTime = queue[qIdx].startUs + (int64_t)(oldTime * 1000000.0f);
-      float newTime = (finishTime - queue[qIdx].startUs) / 1000000.0f;
-      
-      recent[i].no = runnerNo;
-      recent[i].startUnix = queue[qIdx].startUnix;
-      
-      removeFromQueue(qIdx);
-      logEvent("Korrektur", "#" + String(finishNo) + " -> #" + String(runnerNo), "KORRIGIERT");
-      updateResults();
+    if (recent[i].no == (uint16_t)finishNo && !recent[i].hasStart) {
+      recentIdx = i;
       break;
     }
   }
+  if (recentIdx < 0) {
+    server.send(400, "text/plain", "Zielzeit nicht gefunden oder hat bereits Start");
+    return;
+  }
+  
+  // Finde den passenden Orphan-Eintrag für die exakte Zeitberechnung
+  int orphanIdx = -1;
+  for (int i = 0; i < MAX_ORPHAN; i++) {
+    if (orphans[i].valid && orphans[i].endUnix == recent[recentIdx].endUnix) {
+      orphanIdx = i;
+      break;
+    }
+  }
+  
+  // Berechne die Laufzeit
+  float s = 0;
+  if (orphanIdx >= 0) {
+    int64_t dt = orphans[orphanIdx].endUs - queue[qIdx].startUs;
+    s = dt / 1000000.0f;
+    orphans[orphanIdx].valid = false;
+    orphanCount--;
+  }
+  
+  // Aktualisiere den recent-Eintrag
+  recent[recentIdx].s = s;
+  recent[recentIdx].startUnix = queue[qIdx].startUnix;
+  recent[recentIdx].hasStart = true;
+  
+  // Entferne den Start aus der Queue
+  removeFromQueue(qIdx);
+  
+  // Bestzeit aktualisieren
+  if (s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
+  
+  // CSV neu schreiben
+  rewriteCSV();
+  
+  updateResults();
+  logEvent("Zugewiesen", "Z#" + String(finishNo) + " <- S#" + String(runnerNo) + " = " + String(s, 3) + "s", "ZUGEWIESEN");
+  
   server.send(200, "text/plain", "ok");
 }
 
@@ -1033,6 +1064,7 @@ void loopZiel() {
   if (finishFlag) {
     finishFlag = false;
     int64_t fu = finishUs;
+    uint32_t endUnix = toUnixS(fu);
     
     int oldest = findOldestInQueue();
     if (oldest >= 0) {
@@ -1042,7 +1074,7 @@ void loopZiel() {
         uint16_t finishedRunNo = queue[oldest].runNo;
         uint32_t startUnix = queue[oldest].startUnix;
         removeFromQueue(oldest);
-        appendRun(finishedRunNo, s, startUnix, toUnixS(fu));
+        appendRun(finishedRunNo, s, startUnix, endUnix, true);
         sendPkt(T_RESULT, 0, 0, 0, finishedRunNo);
         rxFlag = false;
         radio.startReceive();
@@ -1053,7 +1085,11 @@ void loopZiel() {
         logEvent("Zielimpuls zu kurz", String(dt / 1000000.0f, 3) + " s", "ZU KURZ");
       }
     } else {
-      logEvent("Zielimpuls ohne Start", "", "OHNE START");
+      // Zielimpuls ohne Start -> als Orphan speichern für spätere Zuordnung
+      appendOrphanFinish(endUnix, fu);
+      startFlash();
+      logEvent("Ziel ohne Start", "Z#" + String(totalFinishes) + " " + fmtLocal(endUnix, false), "OHNE START");
+      Serial.printf("Orphan Ziel #%u: %s\n", totalFinishes, fmtLocal(endUnix, false).c_str());
     }
   }
 
@@ -1105,12 +1141,10 @@ void switchRole() {
   ESP.restart();
 }
 
-// Taste halten: Anzeige zeigt die jeweilige Aktion, beim Loslassen wird sie ausgeführt
-// Kurzer Klick (< 2s): Info-Seite für 10 Sekunden anzeigen
 void buttonCheck() {
   static uint32_t t0 = 0;
   static bool down = false;
-  static uint8_t phase = 0;                           // 0 nichts/kurz, 1 Rolle wechseln, 2 Deep Sleep
+  static uint8_t phase = 0;
   bool now = (digitalRead(BUTTON_PIN) == LOW);
   if (now && !down) { down = true; t0 = millis(); phase = 0; }
   if (now && down) {
@@ -1127,10 +1161,6 @@ void buttonCheck() {
     down = false;
     if (phase == 2) goToSleep();
     else if (phase == 1) switchRole();
-    else {
-      // Kurzer Klick: Info-Seite anzeigen für 10 Sekunden
-      infoPageUntil = millis() + INFO_PAGE_MS;
-    }
     phase = 0;
     lastDraw = 0;
   }
