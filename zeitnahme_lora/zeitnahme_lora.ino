@@ -1,12 +1,18 @@
-// Zeitnahme Start/Ziel per LoRa + WLAN-Webserver am Ziel  (v4 - Multi-Fahrer)
+// Zeitnahme Start/Ziel per LoRa + WLAN-Webserver am Ziel  (v4.2 - Multi-Fahrer)
 // Board: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262 + OLED)
 // Bibliotheken: RadioLib, U8g2 (beide über den Bibliotheksverwalter)
+//
+// Neu in v4.2:
+//  - Ergebnisse enthalten Start- UND Zielzeit
+//  - Zielimpuls ohne Start wird als "Orphan" gespeichert (für spätere Zuordnung)
+//  - Korrektur-Funktion: Orphan-Zielzeit kann einem Start zugewiesen werden
+//  - Bei Überholen/Fehlauslösung: nachträgliche Zuordnung möglich
+//  - CSV-Format erweitert: Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel
 //
 // Neu in v4:
 //  - Mehrere Fahrer gleichzeitig auf der Strecke (Queue-System)
 //  - Start-Display zeigt die zugewiesene Laufnummer groß an
-//  - Weboberfläche: Zuordnung Zieldurchfahrt ↔ Laufnummer korrigierbar
-//  - Fahrer ohne Zieldurchfahrt (Ausfall) können entfernt werden
+//  - Fahrer ohne Zieldurchfahrt (DNF) können entfernt werden
 //
 // Auf BEIDE Boards dieselbe Datei flashen. Die Rolle (START oder ZIEL) steht im Flash.
 // PRG-Taste: 2 s halten und loslassen = Rolle wechseln (Neustart),
@@ -23,7 +29,7 @@
 #include <Update.h>
 #include "driver/gpio.h"
 
-#define FIRMWARE_VERSION "4.1"
+#define FIRMWARE_VERSION "4.2"
 
 // ---- Pins Heltec V3 ----
 #define LORA_SCK  9
@@ -376,8 +382,23 @@ String fmtLocal(uint32_t unixS, bool dateToo = true) {
 #define EVT_FILE "/events.csv"
 #define MAX_RECENT 10
 #define MAX_EVT 10
+#define MAX_ORPHAN 10          // max. Zielimpulse ohne Start (für spätere Zuordnung)
 #define RUN_TIMEOUT_S 1800     // 30 min Timeout für Fahrer auf Strecke
-struct Run { uint16_t no; float s; uint32_t startUnix; };
+struct Run { 
+  uint16_t no; 
+  float s;               // Laufzeit in Sekunden (0 = nur Ziel, kein Start)
+  uint32_t startUnix;    // Unix-Zeit Start (0 = kein Start)
+  uint32_t endUnix;      // Unix-Zeit Ziel
+  bool hasStart;         // true = normaler Lauf, false = nur Zielimpuls (Orphan)
+};
+struct OrphanFinish {    // Zielimpuls ohne zugehörigen Start
+  uint32_t endUnix;      // Unix-Zeit des Zielimpulses
+  int64_t endUs;         // esp_timer Zeitpunkt (für spätere Berechnung)
+  bool valid;
+};
+OrphanFinish orphans[MAX_ORPHAN];
+int orphanCount = 0;
+
 struct Evt { uint32_t unixS; char text[48]; };
 Evt evts[MAX_EVT];
 int nEvt = 0;
@@ -386,6 +407,7 @@ uint32_t noteUntil = 0;
 Run recent[MAX_RECENT];
 int nRecent = 0;
 uint16_t totalRuns = 0;
+uint16_t totalFinishes = 0;   // Zähler für Zielimpulse (auch ohne Start)
 float bestTime = 0;
 
 void logEvent(const char* what, const String& details, const char* note) {
@@ -415,15 +437,38 @@ void IRAM_ATTR onFinish() {
   }
 }
 
-void pushRecent(uint16_t no, float s, uint32_t startUnix) {
+void pushRecent(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix, bool hasStart) {
   if (nRecent < MAX_RECENT) nRecent++;
   for (int i = nRecent - 1; i > 0; i--) recent[i] = recent[i - 1];
-  recent[0] = { no, s, startUnix };
+  recent[0] = { no, s, startUnix, endUnix, hasStart };
+}
+
+void addOrphanFinish(uint32_t endUnix, int64_t endUs) {
+  if (orphanCount < MAX_ORPHAN) orphanCount++;
+  for (int i = orphanCount - 1; i > 0; i--) orphans[i] = orphans[i - 1];
+  orphans[0] = { endUnix, endUs, true };
+}
+
+int findOrphanByIndex(int idx) {
+  int count = 0;
+  for (int i = 0; i < MAX_ORPHAN; i++) {
+    if (orphans[i].valid) {
+      if (count == idx) return i;
+      count++;
+    }
+  }
+  return -1;
 }
 
 void updateResults() {
-  resNo = totalRuns;
-  for (int i = 0; i < 3; i++) resMs[i] = (i < nRecent) ? (uint32_t)(recent[i].s * 1000.0f + 0.5f) : 0;
+  resNo = totalFinishes;
+  for (int i = 0; i < 3; i++) {
+    if (i < nRecent && recent[i].hasStart && recent[i].s > 0) {
+      resMs[i] = (uint32_t)(recent[i].s * 1000.0f + 0.5f);
+    } else {
+      resMs[i] = 0;
+    }
+  }
   runNo = totalRuns + 1;
 }
 
@@ -432,45 +477,82 @@ void loadRuns() {
   if (f) {
     while (f.available()) {
       String l = f.readStringUntil('\n');
+      // Format: Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel
       int i1 = l.indexOf(';');
       if (i1 < 1) continue;
       int i2 = l.indexOf(';', i1 + 1);
       int i3 = (i2 > 0) ? l.indexOf(';', i2 + 1) : -1;
+      int i4 = (i3 > 0) ? l.indexOf(';', i3 + 1) : -1;
       uint16_t no = l.substring(0, i1).toInt();
+      if (no == 0) continue;   // Kopfzeile überspringen
       float s = (i2 > 0 ? l.substring(i1 + 1, i2) : l.substring(i1 + 1)).toFloat();
-      uint32_t su = 0;
+      uint32_t su = 0, eu = 0;
       if (i2 > 0) su = (uint32_t)strtoul((i3 > 0 ? l.substring(i2 + 1, i3) : l.substring(i2 + 1)).c_str(), nullptr, 10);
-      if (no == 0) continue;
-      totalRuns = no;
-      if (bestTime == 0 || s < bestTime) bestTime = s;
-      pushRecent(no, s, su);
+      if (i3 > 0) eu = (uint32_t)strtoul((i4 > 0 ? l.substring(i3 + 1, i4) : l.substring(i3 + 1)).c_str(), nullptr, 10);
+      bool hasStart = (su > 0);
+      totalFinishes = no;
+      if (hasStart) totalRuns = no;
+      if (hasStart && s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
+      pushRecent(no, s, su, eu, hasStart);
     }
     f.close();
   }
   updateResults();
 }
 
-void appendRun(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix) {
+void appendRun(uint16_t no, float s, uint32_t startUnix, uint32_t endUnix, bool hasStart) {
   File f = LittleFS.open(CSV_FILE, "a");
   if (f) {
-    if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;Start;Ziel");
-    f.printf("%u;%.3f;%lu;%s;%s\n", no, s, (unsigned long)startUnix,
+    if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+    f.printf("%u;%.3f;%lu;%lu;%s;%s\n", no, s, (unsigned long)startUnix, (unsigned long)endUnix,
              fmtLocal(startUnix).c_str(), fmtLocal(endUnix).c_str());
     f.close();
   }
-  if (bestTime == 0 || s < bestTime) bestTime = s;
-  pushRecent(no, s, startUnix);
+  if (hasStart && s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
+  pushRecent(no, s, startUnix, endUnix, hasStart);
+  totalFinishes = no;
+  updateResults();
+}
+
+// Speichert einen Zielimpuls ohne Start (Orphan) - kann später zugeordnet werden
+void appendOrphanFinish(uint32_t endUnix, int64_t endUs) {
+  totalFinishes++;
+  File f = LittleFS.open(CSV_FILE, "a");
+  if (f) {
+    if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+    f.printf("%u;0.000;0;%lu;;%s\n", totalFinishes, (unsigned long)endUnix, fmtLocal(endUnix).c_str());
+    f.close();
+  }
+  pushRecent(totalFinishes, 0, 0, endUnix, false);
+  addOrphanFinish(endUnix, endUs);
   updateResults();
 }
 
 void clearRuns() {
   LittleFS.remove(CSV_FILE);
   LittleFS.remove(EVT_FILE);
-  nRecent = 0; totalRuns = 0; bestTime = 0; nEvt = 0;
+  nRecent = 0; totalRuns = 0; totalFinishes = 0; bestTime = 0; nEvt = 0;
   for (int i = 0; i < MAX_QUEUE; i++) queue[i].valid = false;
-  queueCount = 0;
+  for (int i = 0; i < MAX_ORPHAN; i++) orphans[i].valid = false;
+  queueCount = 0; orphanCount = 0;
   updateResults();
   lastDraw = 0;
+}
+
+// CSV komplett neu schreiben (nach Korrektur)
+void rewriteCSV() {
+  File f = LittleFS.open(CSV_FILE, "w");
+  if (f) {
+    f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+    // Schreibe von ältestem zu neuestem
+    for (int i = nRecent - 1; i >= 0; i--) {
+      f.printf("%u;%.3f;%lu;%lu;%s;%s\n", 
+               recent[i].no, recent[i].s, 
+               (unsigned long)recent[i].startUnix, (unsigned long)recent[i].endUnix,
+               fmtLocal(recent[i].startUnix).c_str(), fmtLocal(recent[i].endUnix).c_str());
+    }
+    f.close();
+  }
 }
 
 // Queue-Funktionen
@@ -692,12 +774,16 @@ async function upd(){
     '<button class="sm" onclick="dnf('+q.n+')">DNF</button></div>'
   ).join(''):'<div class="c" style="padding:16px">Keine Fahrer auf der Strecke</div>';
   
-  // Ergebnisse
-  runs.innerHTML=d.runs.length?d.runs.map(r=>'<tr><td>#'+r.n+'</td><td>'+r.t+'</td><td>'+f(r.s)+'</td></tr>').join(''):'<tr><td>Keine</td></tr>';
+  // Ergebnisse (mit Start- und Zielzeit)
+  runs.innerHTML=d.runs.length?d.runs.map(r=>{
+    const zeit=r.hasStart?f(r.s):'<em>kein Start</em>';
+    const cls=r.hasStart?'':'style="color:#c0392b"';
+    return '<tr '+cls+'><td>#'+r.n+'</td><td>S:'+r.st+' Z:'+r.et+'</td><td>'+zeit+'</td></tr>';
+  }).join(''):'<tr><td>Keine</td></tr>';
   
-  // Korrektur-Dropdowns
-  finishSel.innerHTML='<option value="">Zieldurchfahrt...</option>'+d.runs.map(r=>'<option value="'+r.n+'">#'+r.n+' ('+f(r.s)+')</option>').join('');
-  runnerSel.innerHTML='<option value="">Lauf# zuweisen...</option>'+d.queue.map(q=>'<option value="'+q.n+'">#'+q.n+'</option>').join('');
+  // Korrektur-Dropdowns: Orphan-Zielzeiten können Starts zugewiesen werden
+  finishSel.innerHTML='<option value="">Zielzeit wählen...</option>'+d.runs.filter(r=>!r.hasStart).map(r=>'<option value="'+r.n+'">Z#'+r.n+' ('+r.et+')</option>').join('');
+  runnerSel.innerHTML='<option value="">Start zuweisen...</option>'+d.queue.map(q=>'<option value="'+q.n+'">#'+q.n+' ('+q.t+')</option>').join('');
   
   evts.innerHTML=d.events.length?d.events.map(e=>'<tr><td>'+e.t+'</td><td>'+e.e+'</td></tr>').join(''):'<tr><td>keine</td></tr>';
  }catch(e){document.getElementById('link').textContent='Keine Verbindung';document.getElementById('link').className='pill bad';}
@@ -741,8 +827,11 @@ void handleApi() {
   j += "],\"runs\":[";
   for (int i = 0; i < nRecent; i++) {
     if (i) j += ",";
-    j += "{\"n\":" + String(recent[i].no) + ",\"s\":" + String(recent[i].s, 3) +
-         ",\"t\":\"" + fmtLocal(recent[i].startUnix, false) + "\"}";
+    j += "{\"n\":" + String(recent[i].no) + 
+         ",\"s\":" + String(recent[i].s, 3) +
+         ",\"st\":\"" + fmtLocal(recent[i].startUnix, false) + "\"" +
+         ",\"et\":\"" + fmtLocal(recent[i].endUnix, false) + "\"" +
+         ",\"hasStart\":" + String(recent[i].hasStart ? "true" : "false") + "}";
   }
   j += "],\"events\":[";
   for (int i = 0; i < nEvt; i++) {
@@ -764,34 +853,64 @@ void handleDnf() {
 }
 
 void handleReassign() {
-  int finishNo = server.arg("finish").toInt();
-  int runnerNo = server.arg("runner").toInt();
+  int finishNo = server.arg("finish").toInt();   // Orphan-Zielzeit (ohne Start)
+  int runnerNo = server.arg("runner").toInt();   // Start aus der Queue
   
+  // Finde den Start in der Queue
   int qIdx = findQueueByRunNo(runnerNo);
   if (qIdx < 0) {
-    server.send(400, "text/plain", "Lauf nicht in Queue");
+    server.send(400, "text/plain", "Start nicht in Queue");
     return;
   }
   
-  // Finde die Zielzeit in recent und ändere die Laufnummer
+  // Finde die Orphan-Zielzeit in recent
+  int recentIdx = -1;
   for (int i = 0; i < nRecent; i++) {
-    if (recent[i].no == finishNo) {
-      float oldTime = recent[i].s;
-      uint32_t oldStartUnix = recent[i].startUnix;
-      
-      // Berechne neue Zeit basierend auf dem tatsächlichen Start
-      int64_t finishTime = queue[qIdx].startUs + (int64_t)(oldTime * 1000000.0f);
-      float newTime = (finishTime - queue[qIdx].startUs) / 1000000.0f;
-      
-      recent[i].no = runnerNo;
-      recent[i].startUnix = queue[qIdx].startUnix;
-      
-      removeFromQueue(qIdx);
-      logEvent("Korrektur", "#" + String(finishNo) + " -> #" + String(runnerNo), "KORRIGIERT");
-      updateResults();
+    if (recent[i].no == (uint16_t)finishNo && !recent[i].hasStart) {
+      recentIdx = i;
       break;
     }
   }
+  if (recentIdx < 0) {
+    server.send(400, "text/plain", "Zielzeit nicht gefunden oder hat bereits Start");
+    return;
+  }
+  
+  // Finde den passenden Orphan-Eintrag für die exakte Zeitberechnung
+  int orphanIdx = -1;
+  for (int i = 0; i < MAX_ORPHAN; i++) {
+    if (orphans[i].valid && orphans[i].endUnix == recent[recentIdx].endUnix) {
+      orphanIdx = i;
+      break;
+    }
+  }
+  
+  // Berechne die Laufzeit
+  float s = 0;
+  if (orphanIdx >= 0) {
+    int64_t dt = orphans[orphanIdx].endUs - queue[qIdx].startUs;
+    s = dt / 1000000.0f;
+    orphans[orphanIdx].valid = false;
+    orphanCount--;
+  }
+  
+  // Aktualisiere den recent-Eintrag
+  recent[recentIdx].s = s;
+  recent[recentIdx].startUnix = queue[qIdx].startUnix;
+  recent[recentIdx].hasStart = true;
+  
+  // Entferne den Start aus der Queue
+  removeFromQueue(qIdx);
+  
+  // Bestzeit aktualisieren
+  if (s > 0 && (bestTime == 0 || s < bestTime)) bestTime = s;
+  
+  // CSV neu schreiben
+  rewriteCSV();
+  
+  updateResults();
+  logEvent("Zugewiesen", "Z#" + String(finishNo) + " <- S#" + String(runnerNo) + " = " + String(s, 3) + "s", "ZUGEWIESEN");
+  
   server.send(200, "text/plain", "ok");
 }
 
@@ -945,6 +1064,7 @@ void loopZiel() {
   if (finishFlag) {
     finishFlag = false;
     int64_t fu = finishUs;
+    uint32_t endUnix = toUnixS(fu);
     
     int oldest = findOldestInQueue();
     if (oldest >= 0) {
@@ -954,7 +1074,7 @@ void loopZiel() {
         uint16_t finishedRunNo = queue[oldest].runNo;
         uint32_t startUnix = queue[oldest].startUnix;
         removeFromQueue(oldest);
-        appendRun(finishedRunNo, s, startUnix, toUnixS(fu));
+        appendRun(finishedRunNo, s, startUnix, endUnix, true);
         sendPkt(T_RESULT, 0, 0, 0, finishedRunNo);
         rxFlag = false;
         radio.startReceive();
@@ -965,7 +1085,11 @@ void loopZiel() {
         logEvent("Zielimpuls zu kurz", String(dt / 1000000.0f, 3) + " s", "ZU KURZ");
       }
     } else {
-      logEvent("Zielimpuls ohne Start", "", "OHNE START");
+      // Zielimpuls ohne Start -> als Orphan speichern für spätere Zuordnung
+      appendOrphanFinish(endUnix, fu);
+      startFlash();
+      logEvent("Ziel ohne Start", "Z#" + String(totalFinishes) + " " + fmtLocal(endUnix, false), "OHNE START");
+      Serial.printf("Orphan Ziel #%u: %s\n", totalFinishes, fmtLocal(endUnix, false).c_str());
     }
   }
 
