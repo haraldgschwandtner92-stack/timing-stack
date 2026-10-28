@@ -76,6 +76,26 @@ struct __attribute__((packed)) Pkt {
   uint8_t  queueLen;    // Ziel: Anzahl Fahrer auf der Strecke
 };
 
+// Datenmodell-Typen MÜSSEN vor der ersten Funktion stehen.
+// Die Arduino-IDE setzt sonst automatisch Prototypen über die Structs
+// und bricht mit "'StartEv' does not name a type" ab.
+#define MAX_EV 300
+struct StartEv  { uint16_t no; uint16_t runId; uint32_t boot; int64_t us; uint16_t finishNo; bool dnf; };
+struct FinishEv { uint16_t no; uint32_t boot; int64_t us; uint16_t startNo; bool ign; };
+struct BootInfo { uint32_t boot; int64_t offUs; };
+
+StartEv* getStart(uint16_t no);
+FinishEv* getFin(uint16_t no);
+StartEv* oldestOpenStart();
+StartEv* findStartByRunId(uint16_t runId);
+bool pairSec(const StartEv& s, const FinishEv& f, float& sec);
+bool isOpen(const StartEv& s);
+void takeResults(const Pkt& r);
+
+// Nochmal einbinden, damit die Arduino-IDE ihre Auto-Prototypen HINTER
+// den Structs einfügt (sonst: "'StartEv' does not name a type").
+#include <Arduino.h>
+
 // Feste Verzögerung zwischen transmit()-Aufruf und echtem Sendebeginn (µs).
 #define TX_CAL_US 1500
 
@@ -453,7 +473,7 @@ void logEvent(const char* what, const String& details, const char* note) {
 
 void IRAM_ATTR onFinish() {
   int64_t now = esp_timer_get_time();
-  if (now - lastFinishIsr > 200000) {
+  if (now - lastFinishIsr > 1000000) {   // 1 s Sperre (Entprellen)
     lastFinishIsr = now;
     finishUs = now;
     finishFlag = true;
@@ -465,9 +485,6 @@ void IRAM_ATTR onFinish() {
 // ---------------------------------------------------------------------
 void journal(const char* fmt, ...);   // schreibt eine Zeile ins Journal (Definition weiter unten)
 
-#define MAX_EV 300
-struct StartEv  { uint16_t no; uint16_t runId; uint32_t boot; int64_t us; uint16_t finishNo; bool dnf; };
-struct FinishEv { uint16_t no; uint32_t boot; int64_t us; uint16_t startNo; bool ign; };
 StartEv  starts[MAX_EV];     // Ring: Platz (no-1) % MAX_EV, gültig wenn .no == no
 FinishEv fins[MAX_EV];
 uint16_t totalStarts = 0, totalFinishes = 0;
@@ -476,7 +493,6 @@ int queueCount = 0;          // Fahrer auf der Strecke (offene Starts)
 float bestTime = 0;
 
 // Pro Neustart die Zuordnung Boot-Zeit -> Uhrzeit (Offset), damit Zeiten auch später noch eine Uhrzeit haben
-struct BootInfo { uint32_t boot; int64_t offUs; };
 BootInfo bootInfo[8];
 int nBootInfo = 0;
 
