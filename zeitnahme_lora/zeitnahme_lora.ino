@@ -776,9 +776,12 @@ async function upd(){
   
   // Ergebnisse (mit Start- und Zielzeit)
   runs.innerHTML=d.runs.length?d.runs.map(r=>{
-    const zeit=r.hasStart?f(r.s):'<em>kein Start</em>';
-    const cls=r.hasStart?'':'style="color:#c0392b"';
-    return '<tr '+cls+'><td>#'+r.n+'</td><td>S:'+r.st+' Z:'+r.et+'</td><td>'+zeit+'</td></tr>';
+    let zeit, cls='';
+    if(!r.hasStart){zeit='<em>kein Start</em>';cls='style="color:#c0392b"';}
+    else if(r.s===0 && !r.et){zeit='<em>DNF</em>';cls='style="color:#e67e22"';}
+    else{zeit=f(r.s);}
+    const st=r.st||'-', et=r.et||'-';
+    return '<tr '+cls+'><td>#'+r.n+'</td><td>S:'+st+' Z:'+et+'</td><td>'+zeit+'</td></tr>';
   }).join(''):'<tr><td>Keine</td></tr>';
   
   // Korrektur-Dropdowns: Orphan-Zielzeiten können Starts zugewiesen werden
@@ -846,8 +849,19 @@ void handleDnf() {
   int n = server.arg("n").toInt();
   int idx = findQueueByRunNo(n);
   if (idx >= 0) {
+    uint32_t startUnix = queue[idx].startUnix;
     removeFromQueue(idx);
-    logEvent("DNF", "Lauf #" + String(n), "DNF");
+    // DNF als Eintrag speichern (Zeit = 0, nur Startzeit, kein Ziel)
+    totalFinishes++;
+    File f = LittleFS.open(CSV_FILE, "a");
+    if (f) {
+      if (f.size() == 0) f.println("Lauf;Sekunden;StartUnix;ZielUnix;Start;Ziel");
+      f.printf("%u;DNF;%lu;0;%s;DNF\n", totalFinishes, (unsigned long)startUnix, fmtLocal(startUnix).c_str());
+      f.close();
+    }
+    pushRecent(totalFinishes, 0, startUnix, 0, true);  // hasStart=true, aber Zeit=0 und kein Ziel
+    updateResults();
+    logEvent("DNF", "Lauf #" + String(n) + " -> #" + String(totalFinishes), "DNF");
   }
   server.send(200, "text/plain", "ok");
 }
