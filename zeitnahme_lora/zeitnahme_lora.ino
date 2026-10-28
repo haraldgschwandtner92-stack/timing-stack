@@ -728,11 +728,11 @@ h3{font-size:15px;font-weight:500;margin:16px 0 8px}
 <h3>Letzte Ergebnisse</h3>
 <table id="runs"><tr><td>Keine</td></tr></table>
 
-<h3>Korrektur</h3>
+<h3>Verknüpfung (bei Überholen)</h3>
 <div class="row">
-<select id="finishSel" style="flex:2"><option value="">Zieldurchfahrt wählen...</option></select>
-<select id="runnerSel" style="flex:2"><option value="">Lauf# zuweisen...</option></select>
-<button onclick="reassign()" class="sm">Zuweisen</button>
+<select id="runnerSel" style="flex:2"><option value="">Start wählen...</option></select>
+<select id="finishSel" style="flex:2"><option value="">Ziel wählen...</option></select>
+<button onclick="reassign()" class="sm">Verknüpfen</button>
 </div>
 
 <h3>Auffälligkeiten</h3>
@@ -784,19 +784,21 @@ async function upd(){
     return '<tr '+cls+'><td>#'+r.n+'</td><td>S:'+st+' Z:'+et+'</td><td>'+zeit+'</td></tr>';
   }).join(''):'<tr><td>Keine</td></tr>';
   
-  // Korrektur-Dropdowns: Orphan-Zielzeiten können Starts zugewiesen werden
-  finishSel.innerHTML='<option value="">Zielzeit wählen...</option>'+d.runs.filter(r=>!r.hasStart).map(r=>'<option value="'+r.n+'">Z#'+r.n+' ('+r.et+')</option>').join('');
-  runnerSel.innerHTML='<option value="">Start zuweisen...</option>'+d.queue.map(q=>'<option value="'+q.n+'">#'+q.n+' ('+q.t+')</option>').join('');
+  // Korrektur-Dropdowns: Start aus Queue mit Orphan-Ziel verknüpfen
+  const starts=d.queue.map(q=>'<option value="'+q.n+'">Start #'+q.n+' ('+q.t+')</option>').join('');
+  const finishes=d.runs.filter(r=>!r.hasStart).map(r=>'<option value="'+r.n+'">Ziel #'+r.n+' ('+r.et+')</option>').join('');
+  runnerSel.innerHTML='<option value="">Start wählen...</option>'+starts;
+  finishSel.innerHTML='<option value="">Ziel wählen...</option>'+finishes;
   
   evts.innerHTML=d.events.length?d.events.map(e=>'<tr><td>'+e.t+'</td><td>'+e.e+'</td></tr>').join(''):'<tr><td>keine</td></tr>';
  }catch(e){document.getElementById('link').textContent='Keine Verbindung';document.getElementById('link').className='pill bad';}
 }
 async function dnf(n){if(confirm('Lauf #'+n+' als Ausfall (DNF) markieren?')){await fetch('/dnf?n='+n);upd();}}
 async function reassign(){
- const fn=finishSel.value,rn=runnerSel.value;
- if(!fn||!rn){alert('Bitte beide Felder auswählen');return;}
- if(confirm('Zieldurchfahrt #'+fn+' dem Lauf #'+rn+' zuweisen?')){
-  await fetch('/reassign?finish='+fn+'&runner='+rn);upd();
+ const sn=runnerSel.value,fn=finishSel.value;
+ if(!sn||!fn){alert('Bitte Start UND Ziel auswählen');return;}
+ if(confirm('Start #'+sn+' mit Ziel #'+fn+' verknüpfen?')){
+  await fetch('/reassign?start='+sn+'&finish='+fn);upd();
  }
 }
 async function clr(){if(confirm('Alle Daten löschen?')){await fetch('/clear');upd();}}
@@ -867,17 +869,17 @@ void handleDnf() {
 }
 
 void handleReassign() {
-  int finishNo = server.arg("finish").toInt();   // Orphan-Zielzeit (ohne Start)
-  int runnerNo = server.arg("runner").toInt();   // Start aus der Queue
+  int startNo = server.arg("start").toInt();    // Start# (aus Queue)
+  int finishNo = server.arg("finish").toInt();  // Ziel# (Orphan ohne Start)
   
   // Finde den Start in der Queue
-  int qIdx = findQueueByRunNo(runnerNo);
+  int qIdx = findQueueByRunNo(startNo);
   if (qIdx < 0) {
     server.send(400, "text/plain", "Start nicht in Queue");
     return;
   }
   
-  // Finde die Orphan-Zielzeit in recent
+  // Finde die Orphan-Zielzeit in recent (hat keinen Start)
   int recentIdx = -1;
   for (int i = 0; i < nRecent; i++) {
     if (recent[i].no == (uint16_t)finishNo && !recent[i].hasStart) {
@@ -886,7 +888,7 @@ void handleReassign() {
     }
   }
   if (recentIdx < 0) {
-    server.send(400, "text/plain", "Zielzeit nicht gefunden oder hat bereits Start");
+    server.send(400, "text/plain", "Ziel nicht gefunden oder hat bereits Start");
     return;
   }
   
@@ -901,16 +903,20 @@ void handleReassign() {
   
   // Berechne die Laufzeit
   float s = 0;
+  uint32_t endUnix = recent[recentIdx].endUnix;
+  uint32_t startUnix = queue[qIdx].startUnix;
+  
   if (orphanIdx >= 0) {
     int64_t dt = orphans[orphanIdx].endUs - queue[qIdx].startUs;
     s = dt / 1000000.0f;
+    // Orphan bleibt erstmal - wird nur aus der Liste entfernt wenn erfolgreich
     orphans[orphanIdx].valid = false;
     orphanCount--;
   }
   
-  // Aktualisiere den recent-Eintrag
+  // Markiere den Orphan-recent-Eintrag als "verwendet" (hasStart = true, behält aber seine Nummer)
   recent[recentIdx].s = s;
-  recent[recentIdx].startUnix = queue[qIdx].startUnix;
+  recent[recentIdx].startUnix = startUnix;
   recent[recentIdx].hasStart = true;
   
   // Entferne den Start aus der Queue
@@ -923,7 +929,7 @@ void handleReassign() {
   rewriteCSV();
   
   updateResults();
-  logEvent("Zugewiesen", "Z#" + String(finishNo) + " <- S#" + String(runnerNo) + " = " + String(s, 3) + "s", "ZUGEWIESEN");
+  logEvent("Verknuepft", "S#" + String(startNo) + " + Z#" + String(finishNo) + " = " + String(s, 3) + "s", "VERKNUEPFT");
   
   server.send(200, "text/plain", "ok");
 }
