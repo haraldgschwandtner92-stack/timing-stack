@@ -473,7 +473,7 @@ void logEvent(const char* what, const String& details, const char* note) {
 
 void IRAM_ATTR onFinish() {
   int64_t now = esp_timer_get_time();
-  if (now - lastFinishIsr > 200000) {
+  if (now - lastFinishIsr > 1000000) {   // 1 s Sperre (Entprellen)
     lastFinishIsr = now;
     finishUs = now;
     finishFlag = true;
