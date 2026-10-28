@@ -29,7 +29,7 @@
 #include <Update.h>
 #include "driver/gpio.h"
 
-#define FIRMWARE_VERSION "4.2"
+#define FIRMWARE_VERSION "4.3"
 
 // ---- Pins Heltec V3 ----
 #define LORA_SCK  9
@@ -136,6 +136,51 @@ void fmtV(char* out, size_t n, uint16_t mv) {
   else snprintf(out, n, "%u.%02u", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
 }
 
+// Akkuspannung in Prozent umrechnen (3.0V = 0%, 4.0V = 100%, linear)
+uint8_t battPercent(uint16_t mv) {
+  if (mv < 3000) return 0;
+  if (mv > 4000) return 100;
+  return (uint8_t)((mv - 3000) * 100 / 1000);
+}
+
+// ---- Info-Seite: Akku, Empfang etc. (wird bei einfachem Klick angezeigt) ----
+uint32_t infoPageUntil = 0;              // zeigt Info-Seite bis zu diesem Zeitpunkt (0 = normale Anzeige)
+#define INFO_PAGE_MS 10000               // Info-Seite wird 10 Sekunden angezeigt
+float globalRssi = 0, globalSnr = 0;     // Empfangsstärke (global für Info-Seite)
+
+void drawInfoPage(uint16_t sMv, uint16_t zMv, bool link) {
+  char b[32];
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x10_tr);
+  
+  // Überschrift
+  display.drawStr(0, 10, "System-Info");
+  
+  // Akku Start
+  uint8_t sP = battPercent(sMv);
+  if (sMv >= 2000) snprintf(b, sizeof(b), "Start:  %3u%% (%u.%02uV)", sP, sMv/1000, (sMv%1000)/10);
+  else snprintf(b, sizeof(b), "Start:  --");
+  display.drawStr(0, 24, b);
+  
+  // Akku Ziel
+  uint8_t zP = battPercent(zMv);
+  if (zMv >= 2000) snprintf(b, sizeof(b), "Ziel:   %3u%% (%u.%02uV)", zP, zMv/1000, (zMv%1000)/10);
+  else snprintf(b, sizeof(b), "Ziel:   --");
+  display.drawStr(0, 36, b);
+  
+  // Verbindungsstatus
+  snprintf(b, sizeof(b), "Funk:   %s", link ? "OK" : "KEINE");
+  display.drawStr(0, 48, b);
+  
+  // RSSI/SNR wenn Verbindung da
+  if (link && globalRssi != 0) {
+    snprintf(b, sizeof(b), "RSSI:%ddBm SNR:%.0fdB", (int)globalRssi, globalSnr);
+    display.drawStr(0, 60, b);
+  }
+  
+  display.sendBuffer();
+}
+
 // ---- Blinken bei erkanntem Start ----
 #define FLASH_PHASE_MS 200
 #define FLASH_BLINKS   2
@@ -185,6 +230,8 @@ void takeResults(const Pkt& r) {
   otherBattMv = r.battMv;
   resNo = r.resNo;
   memcpy(resMs, r.resMs, sizeof(resMs));
+  globalRssi = radio.getRSSI();
+  globalSnr = radio.getSNR();
   queueLen = r.queueLen;
 }
 
@@ -200,12 +247,10 @@ void drawStart() {
   const char* state = millis() < clashUntil ? "ROLLE 2x!" : (noAck ? "KEIN ACK" : "BEREIT");
   display.drawStr(128 - display.getStrWidth(state), 10, state);
   
-  // Zeile 2: Fahrer auf Strecke + Akku
+  // Zeile 2: Fahrer auf Strecke + Akku in Prozent
   snprintf(b, sizeof(b), "Auf Strecke: %u", queueLen);
   display.drawStr(0, 22, b);
-  fmtV(vs, sizeof(vs), battMv);
-  fmtV(vz, sizeof(vz), otherBattMv);
-  snprintf(b, sizeof(b), "S%s Z%sV", vs, vz);
+  snprintf(b, sizeof(b), "S%u%% Z%u%%", battPercent(battMv), battPercent(otherBattMv));
   display.drawStr(128 - display.getStrWidth(b), 22, b);
   
   // Wenn gerade ein Start erfolgt ist: Laufnummer groß anzeigen
@@ -327,7 +372,15 @@ void loopStart() {
   bool link = lastPong && (millis() - lastPong < 10000);
   digitalWrite(LED_PIN, link ? HIGH : (millis() / 300) % 2);
 
-  if (millis() - lastDraw > 200) { lastDraw = millis(); drawStart(); }
+  if (millis() - lastDraw > 200) { 
+    lastDraw = millis(); 
+    if (millis() < infoPageUntil) {
+      bool link = lastPong && (millis() - lastPong < 10000);
+      drawInfoPage(battMv, otherBattMv, link);
+    } else {
+      drawStart(); 
+    }
+  }
   updateFlash();
   delay(5);
 }
@@ -612,12 +665,10 @@ void drawZiel() {
                       (queueCount > 0 ? "AUF STRECKE" : "BEREIT"));
   display.drawStr(128 - display.getStrWidth(state), 10, state);
   
-  // Zeile 2: Fahrer auf Strecke + Akku
+  // Zeile 2: Fahrer auf Strecke + Akku in Prozent
   snprintf(b, sizeof(b), "Fahrer: %d", queueCount);
   display.drawStr(0, 22, b);
-  fmtV(vs, sizeof(vs), otherBattMv);
-  fmtV(vz, sizeof(vz), battMv);
-  snprintf(b, sizeof(b), "S%s Z%sV", vs, vz);
+  snprintf(b, sizeof(b), "S%u%% Z%u%%", battPercent(otherBattMv), battPercent(battMv));
   display.drawStr(128 - display.getStrWidth(b), 22, b);
   
   // Zeilen 3-5: letzte 3 Zeiten
@@ -661,6 +712,8 @@ void handleRx() {
   }
   lastRssi = radio.getRSSI();
   lastSnr = radio.getSNR();
+  globalRssi = lastRssi;
+  globalSnr = lastSnr;
   lastSeenMs = millis();
   seenOnce = true;
   startBatt = p.battMv;
@@ -1137,7 +1190,15 @@ void loopZiel() {
   }
   
   if (millis() - lastBatt > 30000) { lastBatt = millis(); battMv = readBattMv(); }
-  if (millis() - lastDraw > 500) { lastDraw = millis(); drawZiel(); }
+  if (millis() - lastDraw > 500) { 
+    lastDraw = millis(); 
+    if (millis() < infoPageUntil) {
+      bool link = seenOnce && (millis() - lastSeenMs < 10000);
+      drawInfoPage(otherBattMv, battMv, link);
+    } else {
+      drawZiel(); 
+    }
+  }
 }
 
 // =====================================================================
@@ -1195,6 +1256,10 @@ void buttonCheck() {
     down = false;
     if (phase == 2) goToSleep();
     else if (phase == 1) switchRole();
+    else if (phase == 0) {
+      // Kurzer Tastendruck (< 2s): Info-Seite anzeigen
+      infoPageUntil = millis() + INFO_PAGE_MS;
+    }
     phase = 0;
     lastDraw = 0;
   }
