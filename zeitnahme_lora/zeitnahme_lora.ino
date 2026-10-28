@@ -174,7 +174,7 @@ uint32_t showRunNoUntil = 0;        // Laufnummer groß anzeigen bis zu diesem Z
 
 void IRAM_ATTR onStart() {
   int64_t now = esp_timer_get_time();
-  if (!trig && now - lastTrigUs > 2000000) {   // 2 s Sperre (Entprellen)
+  if (!trig && now - lastTrigUs > 500000) {   // 500 ms Sperre (Entprellen)
     trigUs = now;
     lastTrigUs = now;
     trig = true;
